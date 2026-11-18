@@ -117,6 +117,222 @@ function simplifyTables(root) {
   }
 }
 
+// ---------- 贴图文章（分享页 / item_show_type=8） ----------
+// 这类文章微信只给「分享页」模板（common_share.html），页面里没有 #js_content，
+// 正文与图片全在 window.cgiDataNew 这个 JS 字面量里：
+//   title / nick_name / create_time / content_noencode（正文纯文本）
+//   picture_page_info_list[]{ cdn_url, width, height, is_qr_code }
+// 以前找不到 #js_content 就整页转，把 2MB 内联 JS 当正文输出（进 SiYuan 会卡死）。
+// 这里做一个不执行页面代码的 JS 字面量解析器，只取数据字段。
+function parseJsLiteral(src, start) {
+  let i = start;
+  const ws = () => {
+    while (i < src.length && /\s/.test(src[i])) i++;
+  };
+  const fail = (m) => {
+    throw new Error(`${m} @${i}`);
+  };
+
+  function str(q) {
+    i++;
+    let out = "";
+    while (i < src.length) {
+      const c = src[i++];
+      if (c === q) return out;
+      if (c !== "\\") {
+        out += c;
+        continue;
+      }
+      const e = src[i++];
+      if (e === "x") {
+        out += String.fromCharCode(parseInt(src.slice(i, i + 2), 16));
+        i += 2;
+      } else if (e === "u") {
+        if (src[i] === "{") {
+          const end = src.indexOf("}", i);
+          out += String.fromCodePoint(parseInt(src.slice(i + 1, end), 16));
+          i = end + 1;
+        } else {
+          out += String.fromCharCode(parseInt(src.slice(i, i + 4), 16));
+          i += 4;
+        }
+      } else {
+        const map = {
+          n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", v: "\v",
+          "0": "\0", "\\": "\\", "'": "'", '"': '"', "/": "/", "\n": "",
+        };
+        out += map[e] ?? e;
+      }
+    }
+    return fail("unterminated string");
+  }
+
+  function primitive() {
+    ws();
+    const c = src[i];
+    if (c === "'" || c === '"' || c === "`") return str(c);
+    const m = /^(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null|undefined)/.exec(
+      src.slice(i),
+    );
+    if (!m) return fail("unexpected token");
+    i += m[0].length;
+    const t = m[0];
+    if (t === "true") return true;
+    if (t === "false") return false;
+    if (t === "null" || t === "undefined") return null;
+    return Number(t);
+  }
+
+  // 微信的数据里混着 '0' * 1 这种 JS 类型强转，值后面跟运算符时按 JS 语义算掉
+  function coerce(v) {
+    for (;;) {
+      ws();
+      const op = src[i];
+      if (!"*+-/%".includes(op)) return v;
+      const save = i;
+      i++;
+      let rhs;
+      try {
+        rhs = primitive();
+      } catch {
+        i = save;
+        return v;
+      }
+      const a = typeof v === "string" ? Number(v) : v;
+      const b = typeof rhs === "string" ? Number(rhs) : rhs;
+      if (op === "*") v = a * b;
+      else if (op === "/") v = a / b;
+      else if (op === "%") v = a % b;
+      else if (op === "-") v = a - b;
+      else v = typeof a === "string" || typeof b === "string" ? String(a) + String(b) : a + b;
+    }
+  }
+
+  function object() {
+    i++;
+    const o = {};
+    for (;;) {
+      ws();
+      if (i >= src.length) fail("unterminated object");
+      if (src[i] === "}") {
+        i++;
+        return o;
+      }
+      if (src[i] === ",") {
+        i++;
+        continue;
+      }
+      let key;
+      if ("'\"`".includes(src[i])) key = str(src[i]);
+      else {
+        const m = /^[A-Za-z_$][\w$]*/.exec(src.slice(i));
+        if (!m) fail("bad key");
+        i += m[0].length;
+        key = m[0];
+      }
+      ws();
+      if (src[i] !== ":") fail("expect colon");
+      i++;
+      o[key] = value();
+    }
+  }
+
+  function array() {
+    i++;
+    const a = [];
+    for (;;) {
+      ws();
+      if (i >= src.length) fail("unterminated array");
+      if (src[i] === "]") {
+        i++;
+        return a;
+      }
+      if (src[i] === ",") {
+        i++;
+        continue;
+      }
+      a.push(value());
+    }
+  }
+
+  function value() {
+    ws();
+    const c = src[i];
+    if (c === "{") return object();
+    if (c === "[") return array();
+    return coerce(primitive());
+  }
+
+  return value();
+}
+
+const htmlDecode = (s) =>
+  String(s ?? "")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ");
+const escapeHtml = (s) =>
+  String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+const escapeAttr = (s) => escapeHtml(s).replace(/"/g, "&quot;");
+
+function extractPictext(html) {
+  const at = html.indexOf("cgiDataNew");
+  if (at < 0) return null;
+  const brace = html.indexOf("{", at);
+  if (brace < 0) return null;
+  let data;
+  try {
+    data = parseJsLiteral(html, brace);
+  } catch {
+    return null;
+  }
+  if (!data || typeof data !== "object") return null;
+  const text = String(data.content_noencode ?? data.desc ?? "").trim();
+  const pics = Array.isArray(data.picture_page_info_list)
+    ? data.picture_page_info_list.filter((p) => p && p.cdn_url)
+    : [];
+  if (!text && !pics.length) return null;
+  return data;
+}
+
+function pictextImages(data) {
+  return (data.picture_page_info_list || [])
+    .filter((p) => p && p.cdn_url && String(p.is_qr_code) !== "1")
+    .map((p) => htmlDecode(p.cdn_url));
+}
+
+function convertPictext(data, sourceUrl = "") {
+  const text = String(data.content_noencode ?? data.desc ?? "").replace(/\r/g, "");
+  const blocks = [];
+  for (const line of text.split("\n")) blocks.push(`<p>${escapeHtml(line)}</p>`);
+  for (const url of pictextImages(data)) blocks.push(`<p><img src="${escapeAttr(url)}" /></p>`);
+  const md = makeTd()
+    .turndown(blocks.join(""))
+    .replace(/\u00A0/g, " ")
+    .replace(/\n+$/, "\n");
+  const title = String(data.title || "").trim();
+  const site = String(data.nick_name || "").trim();
+  const author = String(data.author || "").trim();
+  const published = String(data.create_time || "").trim();
+  const fm = [`---`, `type: WeChat Article`, `kind: pictext`];
+  if (title) fm.push(`title: ${yq(title)}`);
+  if (site) fm.push(`site: ${yq(site)}`);
+  if (author) fm.push(`author: ${yq(author)}`);
+  if (published) fm.push(`published: ${yq(published)}`);
+  if (sourceUrl) fm.push(`source: ${yq(sourceUrl)}`);
+  fm.push(`---`, ``);
+  return {
+    title,
+    md: `${fm.join("\n")}\n\n${title ? `# ${title}\n\n` : ""}${md}`,
+  };
+}
+
 // ---------- 元数据 ----------
 const yq = (s) =>
   `"${String(s ?? "")
@@ -146,6 +362,10 @@ function meta(html, doc, fallbackTitle) {
 
 // ---------- HTML → Markdown ----------
 function convertHtml(html, fallbackTitle = "") {
+  if (!html.includes('id="js_content"')) {
+    const pic = extractPictext(html);
+    if (pic) return convertPictext(pic, fallbackTitle).md;
+  }
   const doc = new JSDOM(html).window.document;
   const content = doc.querySelector("#js_content") || doc.body;
   cleanStyles(content);
@@ -222,15 +442,17 @@ for (const input of inputs) {
     const html = await res.text();
     const doc = new JSDOM(html).window.document;
     const content = doc.querySelector("#js_content");
-    if (!content || content.textContent.trim().length < 100) {
-      console.error(`FAIL NO_CONTENT(疑似风控/已删) ${input}`);
+    const thin = !content || content.textContent.trim().length < 100;
+    const pic = thin ? extractPictext(html) : null;
+    if (thin && !pic) {
+      console.error(`FAIL NO_CONTENT(疑似风控/已删/分享页无数据) ${input}`);
       continue;
     }
-    const name = (meta(html, doc).title || "article")
+    const name = ((pic ? pic.title : meta(html, doc).title) || "article")
       .replace(/[\\/:*?"<>|#%&{}$!'@+`=\s]+/g, " ")
       .trim()
       .slice(0, 50) || "article";
-    const md = convertHtml(html, input);
+    const md = pic ? convertPictext(pic, input).md : convertHtml(html, input);
     const path = OUT || `${name}.md`;
     writeFileSync(path, md);
     console.log(`OK ${md.length}c -> ${path}`);

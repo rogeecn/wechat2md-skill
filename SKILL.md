@@ -1,6 +1,6 @@
 ---
 name: wechat2md
-description: 微信公众号文章转 Markdown。支持本地 HTML 文件、mp.weixin.qq.com 链接抓取、以及修复已转换 markdown 中残留的原始 HTML 表格块（表格换行渲染失效、代码块被截断等问题）。当用户需要把微信文章或公众号链接转成 Markdown、修复微信文章转换产物、或批量归档公众号内容时使用。
+description: 微信公众号文章转 Markdown。支持本地 HTML 文件、mp.weixin.qq.com 链接抓取、贴图文章（分享页 cgiDataNew）、以及修复已转换 markdown 中残留的原始 HTML 表格块（表格换行渲染失效、代码块被截断等问题）。当用户需要把微信文章或公众号链接转成 Markdown、修复微信文章转换产物、或批量归档公众号内容时使用。
 ---
 
 # 微信公众号文章 → Markdown
@@ -28,6 +28,22 @@ node <skill-dir>/scripts/wechat2md.mjs https://mp.weixin.qq.com/s/xxx   # 抓取
 
 **3. 新版代码块是 `<pre>` 内每行一个 `<code>` 子元素，行间无换行符，缩进用 `&nbsp;`。**
 turndown 默认和 gfm 插件都只读 `firstChild.textContent` → 多行代码被截成第一行。需要自定义规则逐行拼接并把 `\u00A0` 转回空格。代码内含 ``` 时围栏自动加长。
+
+## 贴图文章（分享页 / `item_show_type=8`）
+
+有一类文章微信只返回「分享页」模板（`common_share.html`）：页面里**没有 `#js_content`**，正文和图片全在 `window.cgiDataNew` 这个 JS 字面量里。以前找不到 `#js_content` 就整页转，把 2MB 内联 JS 当正文输出（粘进笔记软件会卡死）。
+
+脚本现在会解析这个字面量，取出：
+
+| 字段 | 用途 |
+| --- | --- |
+| `title` / `nick_name` / `author` / `create_time` | frontmatter |
+| `content_noencode` | 正文纯文本（按 `\n` 分段） |
+| `picture_page_info_list[].cdn_url` | 正文配图（跳过 `is_qr_code=1`） |
+
+输出 frontmatter 会带 `kind: pictext` 以区分。解析器是**手写的 JS 字面量解析器，不 eval 页面代码**：支持单引号字符串与 `\xNN`/`\uNNNN` 转义、无引号 key、尾逗号、以及微信数据里常见的 `'0' * 1` 类型强转。
+
+判定顺序：有 `#js_content` → 正常文章；没有但能解析出 `cgiDataNew` 且有正文或配图 → 贴图文章；两者都没有 → `FAIL NO_CONTENT(疑似风控/已删/分享页无数据)`，不产出空文件。
 
 ## 什么时候表格应该保留 HTML
 
